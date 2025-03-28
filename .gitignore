@@ -1,0 +1,6 @@
+*.pyc
+__pycache__
+context/*
+.env
+.python-version
+conversation_history.txt
