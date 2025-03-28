@@ -1,46 +1,57 @@
 import ollama
-import os
 from pathlib import Path
+import sys
+
 
 class ProjectContextChat:
-    """
-    Classe para interagir com o modelo Qwen2.5-Coder, 
-    incluindo contexto completo de projetos Python complexos.
-    """
-
     def __init__(
-        self,
-        project_root="boilerplate_fastapi",
-        history_file="conversation_history.txt",
-        max_total_tokens=8000,
-        exclude_patterns=None
+        self, context_dir="context", max_total_tokens=8000, exclude_patterns=None
     ):
-        """
-        Args:
-            project_root (str): Caminho para a raiz do projeto
-            history_file (str): Arquivo de histórico
-            max_total_tokens (int): Limite total de tokens para contexto
-            exclude_patterns (list): Padrões de arquivos/diretórios para excluir
-        """
-        self.project_root = Path(project_root)
-        self.history_file = Path(history_file)
+        self.context_dir = Path(context_dir).resolve()
+        self.history_file = self.context_dir / "conversation_history.txt"
         self.max_total_tokens = max_total_tokens
         self.exclude_patterns = exclude_patterns or [
-            "venv", "__pycache__", ".git", "node_modules", "*.log"
+            "venv",
+            "*.log",
+            "__pycache__",
+            "migrations",
         ]
-        
-        self.file_cache = {}  # Cache para metadados de arquivos
+        self.file_cache = {}
+
+        # Validações iniciais
+        if not self.context_dir.is_dir():
+            raise ValueError(
+                f"Diretório de contexto '{self.context_dir}' não encontrado"
+            )
+
+        # Detecta o projeto automaticamente
+        self.project_root = self._detect_project()
         self.history_file.touch(exist_ok=True)
 
+    def _detect_project(self):
+        """Detecta automaticamente o diretório do projeto"""
+        candidates = []
+        for entry in self.context_dir.iterdir():
+            if entry.is_dir() and entry.name != "conversation_history.txt":
+                candidates.append(entry)
+
+        if len(candidates) != 1:
+            raise ValueError(
+                f"Encontrados {len(candidates)} projetos em '{self.context_dir}'. "
+                "Deve haver exatamente um diretório de projeto."
+            )
+
+        return candidates[0]
+
     def _walk_project_files(self):
-        """Retorna todos os arquivos do projeto, excluindo padrões indesejados"""
+        """Varre arquivos do projeto excluindo padrões indesejados"""
         files = []
         for path in self.project_root.rglob("*"):
             if not path.is_file():
                 continue
             if any(
-                path.match(pattern) or 
-                any(excl in path.parts for excl in self.exclude_patterns)
+                path.match(pattern)
+                or any(excl in path.parts for excl in self.exclude_patterns)
                 for pattern in self.exclude_patterns
             ):
                 continue
@@ -48,57 +59,66 @@ class ProjectContextChat:
         return files
 
     def _estimate_tokens(self, text):
-        """Estimativa simples de tokens baseada em espaços"""
+        """Estimativa simples de tokens baseada em palavras"""
         return len(text.split())
 
     def _summarize_file(self, content, max_tokens):
-        """Resume conteúdo de arquivo se exceder o limite de tokens"""
+        """Resume conteúdo de arquivos grandes"""
         tokens = content.split()
         if len(tokens) <= max_tokens:
             return content
         half = max_tokens // 2
         return (
-            " ".join(tokens[:half]) + 
-            "\n[... conteúdo resumido por limite de tokens ...]\n" +
-            " ".join(tokens[-half:])
+            " ".join(tokens[:half])
+            + "\n[... conteúdo resumido por limite de tokens ...]\n"
+            + " ".join(tokens[-half:])
         )
 
     def _build_project_context(self):
-        """Constroi contexto estruturado do projeto"""
+        """Constrói contexto completo do projeto"""
         context = []
         total_tokens = 0
         files = self._walk_project_files()
-        
-        # Ordena arquivos por importância (customizável)
+
+        # Ordena por tipo de arquivo (prioridade para Python)
         priority_order = [".py", ".md", ".env", ".yml", ".toml"]
-        files.sort(key=lambda x: (
-            next((i for i, ext in enumerate(priority_order) if x.suffix == ext), len(priority_order)),
-            str(x)
-        ))
+        files.sort(
+            key=lambda x: (
+                next(
+                    (i for i, ext in enumerate(priority_order) if x.suffix == ext),
+                    len(priority_order),
+                ),
+                str(x),
+            )
+        )
 
         for file_path in files:
             try:
-                # Verifica cache
+                # Verificação de cache
                 last_modified = file_path.stat().st_mtime
-                if file_path in self.file_cache and self.file_cache[file_path]["timestamp"] == last_modified:
+                if (
+                    file_path in self.file_cache
+                    and self.file_cache[file_path]["timestamp"] == last_modified
+                ):
                     content = self.file_cache[file_path]["content"]
                     token_count = self.file_cache[file_path]["tokens"]
                 else:
-                    # Lê e processa novo conteúdo
+                    # Processa novo/alterado
                     with open(file_path, "r", encoding="utf-8") as f:
                         content = f.read()
                     token_count = self._estimate_tokens(content)
-                    content = self._summarize_file(content, 500)  # Limite por arquivo
+                    content = self._summarize_file(content, 500)
                     self.file_cache[file_path] = {
                         "timestamp": last_modified,
                         "content": content,
-                        "tokens": token_count
+                        "tokens": token_count,
                     }
 
                 # Adiciona ao contexto se couber
                 if total_tokens + token_count > self.max_total_tokens:
                     break
-                context.append(f"# {file_path.relative_to(self.project_root)}\n{content}")
+                relative_path = file_path.relative_to(self.project_root)
+                context.append(f"# {relative_path}\n{content}")
                 total_tokens += token_count
 
             except Exception as e:
@@ -106,11 +126,13 @@ class ProjectContextChat:
 
         # Cria sumário do projeto
         project_summary = (
-            f"Estrutura do projeto ({self.project_root.name}):\n" +
-            "\n".join(f"- {f.relative_to(self.project_root)}" for f in files[:20]) +
-            "\n[...]\n" if len(files) > 20 else ""
+            f"Estrutura do projeto '{self.project_root.name}':\n"
+            + "\n".join(f"- {f.relative_to(self.project_root)}" for f in files[:20])
+            + "\n[...]\n"
+            if len(files) > 20
+            else ""
         )
-        
+
         return f"{project_summary}\n\n" + "\n\n".join(context)
 
     def _load_history(self, max_tokens=2000):
@@ -131,7 +153,7 @@ class ProjectContextChat:
             return ""
 
     def chat(self, prompt):
-        """Processa interação com contexto completo"""
+        """Processa interação completa com streaming"""
         try:
             if prompt.lower() in ["sair", "exit"]:
                 print("\nEncerrando a conversa.")
@@ -146,7 +168,7 @@ class ProjectContextChat:
                 f"CONTEXTUALIZAÇÃO DO PROJETO:\n{project_context}\n\n"
                 f"HISTÓRICO DA CONVERSA:\n{history}\n\n"
                 f"NOVA PERGUNTA:\nUser: {prompt}\n\n"
-                "Resposta detalhada (cite arquivos específicos quando relevante):\nAssistant:"
+                "Resposta detalhada (cite arquivos específicos):\nAssistant:"
             )
 
             # Envia para o modelo com streaming
@@ -155,7 +177,7 @@ class ProjectContextChat:
             for chunk in ollama.chat(
                 model="qwen2.5-coder",
                 messages=[{"role": "user", "content": full_prompt}],
-                stream=True
+                stream=True,
             ):
                 token = chunk.get("message", {}).get("content", "")
                 if token:
@@ -170,16 +192,22 @@ class ProjectContextChat:
         except Exception as e:
             print(f"\nErro durante a interação: {e}")
 
-# Exemplo de uso
+
 if __name__ == "__main__":
-    chat = ProjectContextChat(
-        project_root="boilerplate_fastapi",
-        exclude_patterns=["venv", "*.log", "migrations"]
-    )
-    
-    print(f"\nBem-vindo ao assistente do projeto {chat.project_root.name}!")
-    print("Digite 'sair' para encerrar.")
-    
+    try:
+        chat = ProjectContextChat(
+            context_dir="context",
+            exclude_patterns=["venv", "*.log", "__pycache__", "migrations"],
+        )
+    except ValueError as e:
+        print(f"Erro na configuração: {e}")
+        sys.exit(1)
+
+    print(f"\nAssistente iniciado para projeto: {chat.project_root.name}")
+    print(f"Diretório de contexto: {chat.context_dir}")
+    print(f"Arquivo de histórico: {chat.history_file}")
+    print("Digite 'sair' ou 'exit' para encerrar.")
+
     while True:
         prompt = input("\n\nVocê: ")
         if prompt.lower() in ["sair", "exit"]:
